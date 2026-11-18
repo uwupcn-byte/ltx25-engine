@@ -1,10 +1,7 @@
 name: dit-engine
 
-# Builds libdit_engine.so (+ Hexagon skels) for LTX-2.5.
-#
-# Sources are cloned at build time: local-dream at the tag Nightmare ships, its
-# pinned stable-diffusion.cpp submodule, and Nightmare's own patch stack (public
-# repo) plus ours from patches/ applied last.
+# Engine for LTX-2.5: local-dream @ the shipped tag, its pinned sdcpp, Nightmare's
+# dit/* patch stack (the only one CI ever applies), then ours from patches/.
 
 on:
   push:
@@ -18,7 +15,6 @@ env:
   LOCAL_DREAM_REF: v3.0.0-alpha.4
   HEXAGON_TAG: v0.7
   NDK_VERSION: 29.0.14206865
-  NIGHTMARE_REF: main
 
 jobs:
   build:
@@ -40,17 +36,12 @@ jobs:
         with:
           path: ltx25-engine
 
-      - name: Clone local-dream
+      - name: Clone local-dream and nightmare
         run: |
           git clone --depth 1 --branch "$LOCAL_DREAM_REF" https://github.com/xororz/local-dream.git local-dream
+          git clone --depth 1 https://github.com/AbrahamPaulJ/nightmare-mobile.git nm
           echo "local-dream $(git -C local-dream rev-parse HEAD)"
-
-      - name: Clone nightmare (patch stack)
-        run: |
-          git clone --depth 1 --branch "$NIGHTMARE_REF" https://github.com/AbrahamPaulJ/nightmare-mobile.git nm
           echo "nightmare $(git -C nm rev-parse HEAD)"
-          ls nm/backend-patches/*.patch | wc -l
-          ls nm/backend-patches/dit/*.patch | wc -l
 
       - name: Fetch stable-diffusion.cpp at the pinned revision
         run: |
@@ -62,7 +53,7 @@ jobs:
           git submodule update --init --recursive --depth 1
           echo "SDCPP_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "GGML_SHA=$(git -C ggml rev-parse HEAD)" >> "$GITHUB_ENV"
-          test -f docs/ltx2.md && echo "LTX-2.5 docs present" || (echo "::error::no LTX support in this sdcpp"; exit 1)
+          test -f docs/ltx2.md && echo "LTX-2.5 present in this sdcpp" || (echo "::error::no LTX"; exit 1)
 
       - name: Install NDK
         run: |
@@ -70,7 +61,7 @@ jobs:
           yes | "$SDK" --licenses >/dev/null 2>&1 || true
           "$SDK" "ndk;$NDK_VERSION" || "$SDK" --channel=3 "ndk;$NDK_VERSION"
           NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
-          test -d "$NDK" || (echo "::error::NDK did not install"; ls "$ANDROID_HOME/ndk"; exit 1)
+          test -d "$NDK" || (echo "::error::NDK did not install"; exit 1)
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
 
       - name: Extract the Hexagon SDK
@@ -87,41 +78,34 @@ jobs:
             ROOT=$(find "$DEST" -mindepth 2 -maxdepth 2 -type d -name '[0-9]*' | sort -V | tail -1); fi
           test -n "$ROOT" || (echo "::error::no Hexagon SDK root"; exit 1)
           echo "HEXAGON_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
-          echo "SDK at $ROOT"; du -sh "$ROOT" || true
+          du -sh "$ROOT" || true
 
-      - name: Apply Nightmare's patch stack
+      # ⚠ Nightmare's engine CI applies ONLY backend-patches/dit/*. The root
+      # backend-patches/* are for a vendored backend-src layout we do not have.
+      - name: Apply Nightmare's dit patch stack
         run: |
           set -uo pipefail
           SDCPP=local-dream/app/src/main/cpp/3rdparty/stable-diffusion.cpp
-          apply_one() {
-            p="$1"
+          OKS=0; FAILS=0; FAILED=""
+          for p in nm/backend-patches/dit/*.patch; do
+            base=$(basename "$p")
+            case "$base" in spike-*|094-*) echo "skip $base"; continue ;; esac
             case "$p" in
               *.ggml.patch)  repo="$SDCPP/ggml"; args="" ;;
               *.sdcpp.patch) repo="$SDCPP"; args="" ;;
               *)             repo=local-dream; args="--directory=app/src/main/cpp" ;;
             esac
             git -C "$repo" add -A -N >/dev/null 2>&1 || true
-            if git -C "$repo" apply --3way $args "$p" >/dev/null 2>&1; then
-              echo "ok   $(basename "$p")"
-              return 0
+            if git -C "$repo" apply --3way $args "$p" >/dev/null 2>&1 \
+               || git -C "$repo" apply $args "$p" >/dev/null 2>&1; then
+              OKS=$((OKS+1))
+            else
+              FAILS=$((FAILS+1)); FAILED="$FAILED $base"
             fi
-            echo "FAIL $(basename "$p")"
-            git -C "$repo" apply --3way $args "$p" 2>&1 | head -12 || true
-            git -C "$repo" checkout -- . >/dev/null 2>&1 || true
-            return 1
-          }
-          FAILS=0
-          OKS=0
-          for p in nm/backend-patches/*.patch; do
-            if apply_one "$p"; then OKS=$((OKS+1)); else FAILS=$((FAILS+1)); fi
           done
-          for p in nm/backend-patches/dit/*.patch; do
-            if apply_one "$p"; then OKS=$((OKS+1)); else FAILS=$((FAILS+1)); fi
-          done
-          echo "PATCH ok=$OKS fail=$FAILS"
+          echo "dit patches ok=$OKS fail=$FAILS"
+          echo "failed:$FAILED"
           echo "PATCH_FAILS=$FAILS" >> "$GITHUB_ENV"
-          git -C local-dream diff --stat | tail -3 || true
-          git -C "$SDCPP" diff --stat | tail -3 || true
 
       - name: Apply our patches
         run: |
@@ -136,7 +120,7 @@ jobs:
               *)             repo=local-dream; args="--directory=app/src/main/cpp" ;;
             esac
             git -C "$repo" add -A -N
-            git -C "$repo" apply -v $args "$p" || (echo "::error::our patch failed: $p"; exit 1)
+            git -C "$repo" apply $args "$p" || (echo "::error::our patch failed: $p"; exit 1)
           done
 
       - name: Record the ABI version
@@ -179,5 +163,5 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}-abi${{ env.ABI_VERSION }}
           name: engine abi${{ env.ABI_VERSION }} (build ${{ github.run_number }}, ${{ env.PATCH_FAILS }} patch failures)
-          body: LTX-2.5 engine, abi${{ env.ABI_VERSION }}, patch failures ${{ env.PATCH_FAILS }}
+          body: dit stack + ours, abi${{ env.ABI_VERSION }}, patch failures ${{ env.PATCH_FAILS }}
           files: out/*.zip
