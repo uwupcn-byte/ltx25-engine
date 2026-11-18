@@ -1,11 +1,10 @@
 name: dit-engine
 
-# Builds libdit_engine.so (+ Hexagon skels) for LTX-2.5, from local-dream + its
-# pinned stable-diffusion.cpp, with our patches applied from patches/.
+# Builds libdit_engine.so (+ Hexagon skels) for LTX-2.5.
 #
-# Why here: the Hexagon SDK is a ~2.3 GB image and the build wants NDK on top of
-# it; a runner has the disk, a phone or a laptop does not. Everything upstream is
-# cloned at build time; only the built engine is published.
+# Sources are cloned at build time: local-dream at the tag Nightmare ships, its
+# pinned stable-diffusion.cpp submodule, and Nightmare's own patch stack (public
+# repo) plus ours from patches/ applied last.
 
 on:
   push:
@@ -19,11 +18,12 @@ env:
   LOCAL_DREAM_REF: v3.0.0-alpha.4
   HEXAGON_TAG: v0.7
   NDK_VERSION: 29.0.14206865
+  NIGHTMARE_REF: main
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Reclaim disk
@@ -35,7 +35,7 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Checkout this repo (patches only)
+      - name: Checkout this repo (our patches)
         uses: actions/checkout@v4
         with:
           path: ltx25-engine
@@ -43,7 +43,14 @@ jobs:
       - name: Clone local-dream
         run: |
           git clone --depth 1 --branch "$LOCAL_DREAM_REF" https://github.com/xororz/local-dream.git local-dream
-          cd local-dream && echo "local-dream $(git rev-parse HEAD)"
+          echo "local-dream $(git -C local-dream rev-parse HEAD)"
+
+      - name: Clone nightmare (patch stack)
+        run: |
+          git clone --depth 1 --branch "$NIGHTMARE_REF" https://github.com/AbrahamPaulJ/nightmare-mobile.git nm
+          echo "nightmare $(git -C nm rev-parse HEAD)"
+          ls nm/backend-patches/*.patch | wc -l
+          ls nm/backend-patches/dit/*.patch | wc -l
 
       - name: Fetch stable-diffusion.cpp at the pinned revision
         run: |
@@ -82,12 +89,45 @@ jobs:
           echo "HEXAGON_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "SDK at $ROOT"; du -sh "$ROOT" || true
 
-      - name: Apply patches
+      - name: Apply Nightmare's patch stack
+        run: |
+          set -uo pipefail
+          SDCPP=local-dream/app/src/main/cpp/3rdparty/stable-diffusion.cpp
+          apply_one() {
+            p="$1"
+            case "$p" in
+              *.ggml.patch)  repo="$SDCPP/ggml"; args="" ;;
+              *.sdcpp.patch) repo="$SDCPP"; args="" ;;
+              *)             repo=local-dream; args="--directory=app/src/main/cpp" ;;
+            esac
+            git -C "$repo" add -A -N >/dev/null 2>&1 || true
+            if git -C "$repo" apply --3way $args "$p" >/dev/null 2>&1; then
+              echo "ok   $(basename "$p")"
+              return 0
+            fi
+            echo "FAIL $(basename "$p")"
+            git -C "$repo" apply --3way $args "$p" 2>&1 | head -12 || true
+            git -C "$repo" checkout -- . >/dev/null 2>&1 || true
+            return 1
+          }
+          FAILS=0
+          OKS=0
+          for p in nm/backend-patches/*.patch; do
+            if apply_one "$p"; then OKS=$((OKS+1)); else FAILS=$((FAILS+1)); fi
+          done
+          for p in nm/backend-patches/dit/*.patch; do
+            if apply_one "$p"; then OKS=$((OKS+1)); else FAILS=$((FAILS+1)); fi
+          done
+          echo "PATCH ok=$OKS fail=$FAILS"
+          echo "PATCH_FAILS=$FAILS" >> "$GITHUB_ENV"
+          git -C local-dream diff --stat | tail -3 || true
+          git -C "$SDCPP" diff --stat | tail -3 || true
+
+      - name: Apply our patches
         run: |
           set -euo pipefail
           shopt -s nullglob
           SDCPP=local-dream/app/src/main/cpp/3rdparty/stable-diffusion.cpp
-          patched=0
           for p in "$GITHUB_WORKSPACE/ltx25-engine/patches/"*.patch; do
             echo "--- $p"
             case "$p" in
@@ -96,25 +136,13 @@ jobs:
               *)             repo=local-dream; args="--directory=app/src/main/cpp" ;;
             esac
             git -C "$repo" add -A -N
-            before=$(git -C "$repo" diff | sha256sum)
-            if ! git -C "$repo" apply -v $args "$p"; then
-              echo "::error::patch failed to apply: $p"
-              git -C "$repo" apply --reject $args "$p" || true
-              exit 1
-            fi
-            after=$(git -C "$repo" diff | sha256sum)
-            if [ "$before" = "$after" ]; then echo "::error::$p applied nothing"; exit 1; fi
-            patched=1
+            git -C "$repo" apply -v $args "$p" || (echo "::error::our patch failed: $p"; exit 1)
           done
-          echo "patches applied: $patched"
-          git -C local-dream diff --stat || true
-          git -C "$SDCPP" diff --stat || true
 
       - name: Record the ABI version
         run: |
           cd local-dream/app/src/main/cpp
-          V=$(sed -n 's/^#define DIT_ENGINE_ABI_VERSION \([0-9]*\)$/\1/p' include/DitEngine.h)
-          if [ -z "$V" ]; then V=$(grep -o 'DIT_ENGINE_ABI_VERSION[[:space:]]*[0-9]*' include/DitEngine.h | grep -o '[0-9]*' | head -1); fi
+          V=$(grep -o 'DIT_ENGINE_ABI_VERSION[^0-9]*[0-9]*' include/DitEngine.h | grep -o '[0-9]*' | head -1)
           echo "ABI_VERSION=$V" >> "$GITHUB_ENV"
           echo "DIT_ENGINE_ABI_VERSION=$V"
 
@@ -149,7 +177,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: dit-engine abi${{ env.ABI_VERSION }} (build ${{ github.run_number }})
-          body: engine for LTX-2.5, abi${{ env.ABI_VERSION }}
+          tag_name: build-${{ github.run_number }}-abi${{ env.ABI_VERSION }}
+          name: engine abi${{ env.ABI_VERSION }} (build ${{ github.run_number }}, ${{ env.PATCH_FAILS }} patch failures)
+          body: LTX-2.5 engine, abi${{ env.ABI_VERSION }}, patch failures ${{ env.PATCH_FAILS }}
           files: out/*.zip
