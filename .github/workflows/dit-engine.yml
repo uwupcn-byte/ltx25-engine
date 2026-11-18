@@ -1,0 +1,155 @@
+name: dit-engine
+
+# Builds libdit_engine.so (+ Hexagon skels) for LTX-2.5, from local-dream + its
+# pinned stable-diffusion.cpp, with our patches applied from patches/.
+#
+# Why here: the Hexagon SDK is a ~2.3 GB image and the build wants NDK on top of
+# it; a runner has the disk, a phone or a laptop does not. Everything upstream is
+# cloned at build time; only the built engine is published.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  LOCAL_DREAM_REF: v3.0.0-alpha.4
+  HEXAGON_TAG: v0.7
+  NDK_VERSION: 29.0.14206865
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Reclaim disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      /usr/local/lib/android/sdk/ndk /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/powershell /usr/share/swift || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Checkout this repo (patches only)
+        uses: actions/checkout@v4
+        with:
+          path: ltx25-engine
+
+      - name: Clone local-dream
+        run: |
+          git clone --depth 1 --branch "$LOCAL_DREAM_REF" https://github.com/xororz/local-dream.git local-dream
+          cd local-dream && echo "local-dream $(git rev-parse HEAD)"
+
+      - name: Fetch stable-diffusion.cpp at the pinned revision
+        run: |
+          cd local-dream
+          git submodule update --init --recursive --depth 1 -- app/src/main/cpp/3rdparty/stable-diffusion.cpp
+          cd app/src/main/cpp/3rdparty/stable-diffusion.cpp
+          git fetch --depth 1 origin 35a3d48b23581d2be7c3ad95e92f34662bb5f305
+          git checkout FETCH_HEAD
+          git submodule update --init --recursive --depth 1
+          echo "SDCPP_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "GGML_SHA=$(git -C ggml rev-parse HEAD)" >> "$GITHUB_ENV"
+          test -f docs/ltx2.md && echo "LTX-2.5 docs present" || (echo "::error::no LTX support in this sdcpp"; exit 1)
+
+      - name: Install NDK
+        run: |
+          SDK="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDK" --licenses >/dev/null 2>&1 || true
+          "$SDK" "ndk;$NDK_VERSION" || "$SDK" --channel=3 "ndk;$NDK_VERSION"
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          test -d "$NDK" || (echo "::error::NDK did not install"; ls "$ANDROID_HOME/ndk"; exit 1)
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+
+      - name: Extract the Hexagon SDK
+        run: |
+          set -euo pipefail
+          docker create --name hexsdk ghcr.io/snapdragon-toolchain/arm64-android:$HEXAGON_TAG
+          DEST="$RUNNER_TEMP/hexsdk"
+          mkdir -p "$DEST"
+          docker cp hexsdk:/opt/hexagon - | tar -x -C "$DEST" --no-same-permissions --no-same-owner
+          docker rm hexsdk
+          chmod -R u+rwX "$DEST"
+          MARK=$(find "$DEST" -maxdepth 3 -name setup_sdk_env.source | sort -V | tail -1)
+          if [ -n "$MARK" ]; then ROOT=$(dirname "$MARK"); else
+            ROOT=$(find "$DEST" -mindepth 2 -maxdepth 2 -type d -name '[0-9]*' | sort -V | tail -1); fi
+          test -n "$ROOT" || (echo "::error::no Hexagon SDK root"; exit 1)
+          echo "HEXAGON_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "SDK at $ROOT"; du -sh "$ROOT" || true
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          SDCPP=local-dream/app/src/main/cpp/3rdparty/stable-diffusion.cpp
+          patched=0
+          for p in "$GITHUB_WORKSPACE/ltx25-engine/patches/"*.patch; do
+            echo "--- $p"
+            case "$p" in
+              *.ggml.patch)  repo="$SDCPP/ggml"; args="" ;;
+              *.sdcpp.patch) repo="$SDCPP"; args="" ;;
+              *)             repo=local-dream; args="--directory=app/src/main/cpp" ;;
+            esac
+            git -C "$repo" add -A -N
+            before=$(git -C "$repo" diff | sha256sum)
+            if ! git -C "$repo" apply -v $args "$p"; then
+              echo "::error::patch failed to apply: $p"
+              git -C "$repo" apply --reject $args "$p" || true
+              exit 1
+            fi
+            after=$(git -C "$repo" diff | sha256sum)
+            if [ "$before" = "$after" ]; then echo "::error::$p applied nothing"; exit 1; fi
+            patched=1
+          done
+          echo "patches applied: $patched"
+          git -C local-dream diff --stat || true
+          git -C "$SDCPP" diff --stat || true
+
+      - name: Record the ABI version
+        run: |
+          cd local-dream/app/src/main/cpp
+          V=$(sed -n 's/^#define DIT_ENGINE_ABI_VERSION \([0-9]*\)$/\1/p' include/DitEngine.h)
+          if [ -z "$V" ]; then V=$(grep -o 'DIT_ENGINE_ABI_VERSION[[:space:]]*[0-9]*' include/DitEngine.h | grep -o '[0-9]*' | head -1); fi
+          echo "ABI_VERSION=$V" >> "$GITHUB_ENV"
+          echo "DIT_ENGINE_ABI_VERSION=$V"
+
+      - name: Build
+        run: |
+          cd local-dream/app/src/main/cpp
+          bash dit/build.sh
+          df -h /
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd local-dream/app/src/main
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp jniLibs/arm64-v8a/libdit_engine.so "$GITHUB_WORKSPACE/out/"
+          cp assets/ditlibs/libggml-htp-v79.so assets/ditlibs/libggml-htp-v81.so "$GITHUB_WORKSPACE/out/" || true
+          for V in v73 v75; do
+            S=cpp/dit/build/android/sdcpp/ggml/src/ggml-hexagon/libggml-htp-$V.so
+            if [ -f "$S" ]; then cp "$S" "$GITHUB_WORKSPACE/out/"; else echo "no $V skel"; fi
+          done
+          cd "$GITHUB_WORKSPACE/out"
+          zip -j -X "dit-engine-abi${ABI_VERSION}.zip" libdit_engine.so
+          ls -l
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dit-engine-abi${{ env.ABI_VERSION }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: dit-engine abi${{ env.ABI_VERSION }} (build ${{ github.run_number }})
+          body: engine for LTX-2.5, abi${{ env.ABI_VERSION }}
+          files: out/*.zip
