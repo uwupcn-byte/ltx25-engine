@@ -80,16 +80,19 @@ jobs:
           echo "HEXAGON_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
           du -sh "$ROOT" || true
 
-      # ⚠ Nightmare's engine CI applies ONLY backend-patches/dit/*. The root
-      # backend-patches/* are for a vendored backend-src layout we do not have.
+      # Nightmare's engine CI applies only backend-patches/dit/*. A failure report
+      # is written to report.txt and shipped as the release body, since the run
+      # log itself is not readable from outside.
       - name: Apply Nightmare's dit patch stack
         run: |
           set -uo pipefail
           SDCPP=local-dream/app/src/main/cpp/3rdparty/stable-diffusion.cpp
-          OKS=0; FAILS=0; FAILED=""
+          REPORT="$GITHUB_WORKSPACE/report.txt"
+          OKS=0; FAILS=0; SKIPS=0
+          : > "$REPORT"
           for p in nm/backend-patches/dit/*.patch; do
             base=$(basename "$p")
-            case "$base" in spike-*|094-*) echo "skip $base"; continue ;; esac
+            case "$base" in spike-*|094-*) SKIPS=$((SKIPS+1)); continue ;; esac
             case "$p" in
               *.ggml.patch)  repo="$SDCPP/ggml"; args="" ;;
               *.sdcpp.patch) repo="$SDCPP"; args="" ;;
@@ -100,11 +103,14 @@ jobs:
                || git -C "$repo" apply $args "$p" >/dev/null 2>&1; then
               OKS=$((OKS+1))
             else
-              FAILS=$((FAILS+1)); FAILED="$FAILED $base"
+              FAILS=$((FAILS+1))
+              ERR=$(git -C "$repo" apply --check $args "$p" 2>&1 | head -3 | tr '\n' ' ')
+              echo "${base} :: ${repo} :: ${ERR}" >> "$REPORT"
             fi
           done
-          echo "dit patches ok=$OKS fail=$FAILS"
-          echo "failed:$FAILED"
+          echo "ok=$OKS fail=$FAILS skip=$SKIPS" | tee -a "$REPORT"
+          sed -i "1i dit patches ok=$OKS fail=$FAILS skip=$SKIPS" "$REPORT"
+          head -40 "$REPORT"
           echo "PATCH_FAILS=$FAILS" >> "$GITHUB_ENV"
 
       - name: Apply our patches
@@ -163,5 +169,5 @@ jobs:
         with:
           tag_name: build-${{ github.run_number }}-abi${{ env.ABI_VERSION }}
           name: engine abi${{ env.ABI_VERSION }} (build ${{ github.run_number }}, ${{ env.PATCH_FAILS }} patch failures)
-          body: dit stack + ours, abi${{ env.ABI_VERSION }}, patch failures ${{ env.PATCH_FAILS }}
+          body_path: report.txt
           files: out/*.zip
